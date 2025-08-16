@@ -71,6 +71,69 @@ function generateRandomUrl(length = 8) {
   return result;
 }
 
+// Auto-save functionality
+const pendingNotes = new Map(); // Store notes that need to be saved
+const saveTimers = new Map(); // Store timers for each note
+const noteEditStartTimes = new Map();
+
+async function saveNoteToSupabase(noteId, data) {
+  try {
+    // Encrypt data
+    const encryptedHeading = encrypt(data.heading);
+    const encryptedContent = encrypt(data.content);
+
+    const { error } = await supabase.from("notes").upsert(
+      {
+        note_id: noteId,
+        heading_encrypted: encryptedHeading.encrypted,
+        heading_iv: encryptedHeading.iv,
+        heading_auth_tag: encryptedHeading.authTag,
+        content_encrypted: encryptedContent.encrypted,
+        content_iv: encryptedContent.iv,
+        content_auth_tag: encryptedContent.authTag,
+        updated_at: new Date().toISOString(),
+      },
+      {
+        onConflict: ["note_id"],
+      }
+    );
+
+    if (error) throw error;
+
+    console.log(`Note ${noteId} auto-saved successfully`);
+
+    // Remove from pending notes after successful save
+    pendingNotes.delete(noteId);
+
+    return true;
+  } catch (error) {
+    console.error(`Error auto-saving note ${noteId}:`, error);
+    return false;
+  }
+}
+
+function scheduleAutoSave(noteId, data) {
+  // Clear existing timer if any
+  if (saveTimers.has(noteId)) {
+    clearTimeout(saveTimers.get(noteId));
+  }
+
+  // Store the latest data
+  pendingNotes.set(noteId, data);
+
+  // Set new timer for 2 minutes (120000 ms)
+  const timer = setTimeout(async () => {
+    const noteData = pendingNotes.get(noteId);
+    if (noteData) {
+      await saveNoteToSupabase(noteId, noteData);
+    }
+    saveTimers.delete(noteId);
+  }, 120000); // 2 minutes
+
+  saveTimers.set(noteId, timer);
+  console.log(`Auto-save scheduled for note ${noteId} in 2 minutes`);
+}
+
 // Socket.io connection handling
 io.on("connection", (socket) => {
   console.log("User connected:", socket.id);
@@ -81,35 +144,30 @@ io.on("connection", (socket) => {
     console.log(`User ${socket.id} joined note room: ${noteId}`);
   });
 
-  // Handle real-time note updates
+  // Handle real-time note updates with auto-save
   socket.on("note-update", async (data) => {
     const { noteId, heading, content } = data;
 
     try {
-      // Encrypt data before storing
-      const encryptedHeading = encrypt(heading);
-      const encryptedContent = encrypt(content);
-
-      // Update in database
-      const { error } = await supabase
-        .from("notes")
-        .update({
-          heading_encrypted: encryptedHeading.encrypted,
-          heading_iv: encryptedHeading.iv,
-          heading_auth_tag: encryptedHeading.authTag,
-          content_encrypted: encryptedContent.encrypted,
-          content_iv: encryptedContent.iv,
-          content_auth_tag: encryptedContent.authTag,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("note_id", noteId);
-
-      if (!error) {
-        // Broadcast to all users in the room except sender
-        socket.to(noteId).emit("note-updated", { heading, content });
+      // Set edit start time only once
+      if (!noteEditStartTimes.has(noteId)) {
+        noteEditStartTimes.set(noteId, new Date().toISOString());
       }
+
+      // Schedule auto-save for this note
+      scheduleAutoSave(noteId, {
+        heading,
+        content,
+        created_at: noteEditStartTimes.get(noteId),
+        updated_at: new Date().toISOString(),
+      });
+
+      // Broadcast to all users in the room except sender
+      socket.to(noteId).emit("note-updated", { heading, content });
+
+      console.log(`Note ${noteId} updated and auto-save scheduled`);
     } catch (error) {
-      console.error("Error updating note:", error);
+      console.error("Error handling note update:", error);
     }
   });
 
@@ -131,6 +189,21 @@ app.get("/api/note/:noteId", async (req, res) => {
   const { noteId } = req.params;
 
   try {
+    // First check if there are pending local changes
+    const localData = pendingNotes.get(noteId);
+
+    if (localData) {
+      console.log(`Returning local changes for note ${noteId}`);
+      return res.json({
+        noteId,
+        heading: localData.heading,
+        content: localData.content,
+        updatedAt: localData.updated_at,
+        isLocalData: true,
+        message: "Returning unsaved local changes",
+      });
+    }
+
     const { data, error } = await supabase
       .from("notes")
       .select("*")
@@ -203,41 +276,28 @@ app.get("/api/note/:noteId", async (req, res) => {
   }
 });
 
-// Save note
-app.post("/api/note/:noteId/save", async (req, res) => {
+// Manual save endpoint (optional - for force save)
+app.post("/api/note/:noteId/force-save", async (req, res) => {
   const { noteId } = req.params;
   const { heading, content } = req.body;
 
   try {
-    // Encrypt data
-    const encryptedHeading = encrypt(heading);
-    const encryptedContent = encrypt(content);
+    const success = await saveNoteToSupabase(noteId, { heading, content });
 
-    const { data, error } = await supabase
-      .from("notes")
-      .upsert(
-        {
-          note_id: noteId,
-          heading_encrypted: encryptedHeading.encrypted,
-          heading_iv: encryptedHeading.iv,
-          heading_auth_tag: encryptedHeading.authTag,
-          content_encrypted: encryptedContent.encrypted,
-          content_iv: encryptedContent.iv,
-          content_auth_tag: encryptedContent.authTag,
-          updated_at: new Date().toISOString(),
-        },
-        {
-          onConflict: ["note_id"],
-        }
-      )
-      .select()
-      .single();
+    if (success) {
+      // Clear any pending auto-save for this note since we just saved manually
+      if (saveTimers.has(noteId)) {
+        clearTimeout(saveTimers.get(noteId));
+        saveTimers.delete(noteId);
+      }
+      pendingNotes.delete(noteId);
 
-    if (error) throw error;
-
-    res.json({ success: true, message: "Note saved successfully" });
+      res.json({ success: true, message: "Note force-saved successfully" });
+    } else {
+      res.status(500).json({ error: "Failed to save note" });
+    }
   } catch (error) {
-    console.error("Error saving note: a45: ", error);
+    console.error("Error force-saving note:", error);
     res.status(500).json({ error: "Failed to save note" });
   }
 });
@@ -247,6 +307,13 @@ app.delete("/api/note/:noteId", async (req, res) => {
   const { noteId } = req.params;
 
   try {
+    // Clear any pending auto-save for this note
+    if (saveTimers.has(noteId)) {
+      clearTimeout(saveTimers.get(noteId));
+      saveTimers.delete(noteId);
+    }
+    pendingNotes.delete(noteId);
+
     const { error } = await supabase
       .from("notes")
       .delete()
@@ -256,7 +323,7 @@ app.delete("/api/note/:noteId", async (req, res) => {
 
     res.json({ success: true, message: "Note deleted successfully" });
   } catch (error) {
-    console.log("here error", noteId);
+    console.log("Error deleting note:", noteId);
     console.error("Error deleting note:", error);
     res.status(500).json({ error: "Failed to delete note" });
   }
@@ -311,11 +378,59 @@ app.get("/api/notes", async (req, res) => {
       };
     });
 
+    for (const [noteId, data] of pendingNotes.entries()) {
+      decryptedNotes.unshift({
+        noteId: noteId,
+        heading: data?.heading || "Untitled",
+        content:
+          data?.content.substring(0, 100) +
+          (data?.content.length > 100 ? "..." : ""),
+        createdAt: data?.created_at,
+        updatedAt: data?.updated_at,
+      });
+    }
     res.json(decryptedNotes);
   } catch (error) {
     console.error("Error fetching notes:", error);
     res.status(500).json({ error: "Failed to fetch notes" });
   }
+});
+
+// Graceful shutdown - save all pending notes
+process.on("SIGTERM", async () => {
+  console.log("SIGTERM received, saving all pending notes...");
+
+  const savePromises = [];
+  for (const [noteId, data] of pendingNotes.entries()) {
+    savePromises.push(saveNoteToSupabase(noteId, data));
+  }
+
+  try {
+    await Promise.all(savePromises);
+    console.log("All pending notes saved successfully");
+  } catch (error) {
+    console.error("Error saving pending notes during shutdown:", error);
+  }
+
+  process.exit(0);
+});
+
+process.on("SIGINT", async () => {
+  console.log("SIGINT received, saving all pending notes...");
+
+  const savePromises = [];
+  for (const [noteId, data] of pendingNotes.entries()) {
+    savePromises.push(saveNoteToSupabase(noteId, data));
+  }
+
+  try {
+    await Promise.all(savePromises);
+    console.log("All pending notes saved successfully");
+  } catch (error) {
+    console.error("Error saving pending notes during shutdown:", error);
+  }
+
+  process.exit(0);
 });
 
 const PORT = process.env.PORT || 3001;

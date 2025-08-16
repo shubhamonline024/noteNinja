@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import {
   Copy,
   Save,
@@ -26,9 +26,9 @@ const App = () => {
   const [lastSaved, setLastSaved] = useState(null);
   const [copySuccess, setCopySuccess] = useState(false);
 
-  const saveTimeoutRef = useRef(null);
   const headingRef = useRef(null);
   const contentRef = useRef(null);
+  const localChangeRef = useRef(false);
 
   // Socket connection management
   useEffect(() => {
@@ -43,8 +43,12 @@ const App = () => {
     });
 
     socket.on("note-updated", (data) => {
-      setHeading(data.heading);
-      setContent(data.content);
+      if (data.heading !== heading) {
+        setHeading(data.heading);
+      }
+      if (data.content !== content) {
+        setContent(data.content);
+      }
     });
 
     return () => {
@@ -61,26 +65,6 @@ const App = () => {
     }
   }, [noteId, currentView]);
 
-  // Auto-save functionality
-  const autoSave = useCallback(() => {
-    if (saveTimeoutRef.current) {
-      clearTimeout(saveTimeoutRef.current);
-    }
-
-    saveTimeoutRef.current = setTimeout(async () => {
-      if (noteId && (heading || content)) {
-        await saveNote(false);
-      }
-    }, 2000);
-  }, [noteId, heading, content]);
-
-  // Trigger auto-save on content change
-  useEffect(() => {
-    if (currentView === "note") {
-      autoSave();
-    }
-  }, [heading, content, autoSave, currentView]);
-
   // Keyboard shortcuts
   useEffect(() => {
     const handleKeyDown = (e) => {
@@ -95,6 +79,13 @@ const App = () => {
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [currentView, noteId, heading, content]);
+
+  useEffect(() => {
+    if (currentView === "note" && localChangeRef.current) {
+      socket.emit("note-update", { noteId, heading, content });
+      localChangeRef.current = false;
+    }
+  }, [noteId, heading, content]);
 
   // Create new note
   const createNewNote = async () => {
@@ -132,19 +123,19 @@ const App = () => {
 
     setIsSaving(true);
     try {
-      const response = await fetch(`${API_BASE}/api/note/${noteId}/save`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ heading, content }),
-      });
+      const response = await fetch(
+        `${API_BASE}/api/note/${noteId}/force-save`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ heading, content }),
+        }
+      );
 
       if (response.ok) {
         setLastSaved(new Date().toISOString());
-
-        // Emit real-time update
-        socket.emit("note-update", { noteId, heading, content });
 
         if (showFeedback) {
           // Visual feedback for manual save
@@ -445,7 +436,10 @@ const App = () => {
               ref={headingRef}
               type="text"
               value={heading}
-              onChange={(e) => setHeading(e.target.value)}
+              onChange={(e) => {
+                localChangeRef.current = true;
+                setHeading(e.target.value);
+              }}
               placeholder="Enter note title..."
               className="w-full text-xl font-semibold text-gray-900 placeholder-gray-400 border-none outline-none bg-transparent"
             />
@@ -463,7 +457,10 @@ const App = () => {
             <textarea
               ref={contentRef}
               value={content}
-              onChange={(e) => setContent(e.target.value)}
+              onChange={(e) => {
+                localChangeRef.current = true;
+                setContent(e.target.value);
+              }}
               placeholder="Start typing your note..."
               className="w-full h-96 p-6 text-gray-700 placeholder-gray-400 border-none outline-none resize-none bg-transparent"
               style={{ minHeight: "500px" }}
